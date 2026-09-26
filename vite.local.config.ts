@@ -3,11 +3,11 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
   root: "pages-app",
-  base: "/shiguang-study-journal/",
+  base: "/",
   publicDir: "../public",
   plugins: [react()],
   build: {
-    outDir: "../pages-dist",
+    outDir: "../local-dist",
     emptyOutDir: true,
   },
 });

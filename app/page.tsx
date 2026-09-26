@@ -70,8 +70,11 @@ function Mark({ children }: { children: React.ReactNode }) {
 }
 
 export default function Home() {
+  const currentDate = "2026-09-27";
   const [view, setView] = useState<View>("journal");
   const [entries, setEntries] = useState<Entry[]>(initialEntries);
+  const [dailySummary, setDailySummary] = useState("把异步状态这件事真正讲明白。");
+  const [serverMode, setServerMode] = useState<"connecting" | "local" | "offline">("connecting");
   const [filter, setFilter] = useState("all");
   const [query, setQuery] = useState("");
   const [saved, setSaved] = useState(true);
@@ -86,25 +89,63 @@ export default function Home() {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    const cached = window.localStorage.getItem("shiguang-entries");
-    if (cached) {
-      try { setEntries(JSON.parse(cached)); } catch { /* keep sample data */ }
-    }
+    let active = true;
+    Promise.all([
+      fetch("/api/config").then((response) => {
+        if (!response.ok) throw new Error("local service unavailable");
+        return response.json();
+      }),
+      fetch(`/api/days/${currentDate}`).then((response) => {
+        if (!response.ok) throw new Error("day unavailable");
+        return response.json();
+      }),
+    ]).then(([, result]) => {
+      if (!active) return;
+      setServerMode("local");
+      if (result.exists && result.day) {
+        setEntries(result.day.entries || []);
+        setDailySummary(result.day.summary || "");
+        setSaved(true);
+      } else {
+        fetch(`/api/days/${currentDate}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ summary: dailySummary, entries: initialEntries }),
+        }).then(() => setSaved(true));
+      }
+    }).catch(() => {
+      if (!active) return;
+      setServerMode("offline");
+      setSaved(false);
+    });
+    return () => { active = false; };
   }, []);
 
-  useEffect(() => {
-    window.localStorage.setItem("shiguang-entries", JSON.stringify(entries));
-  }, [entries]);
-
-  const markChanged = () => {
+  const queueSave = (nextEntries: Entry[], nextSummary: string) => {
     setSaved(false);
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => setSaved(true), 720);
+    if (serverMode !== "local") return;
+    saveTimer.current = setTimeout(async () => {
+      try {
+        const response = await fetch(`/api/days/${currentDate}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ summary: nextSummary, entries: nextEntries }),
+        });
+        if (!response.ok) throw new Error("保存失败");
+        setSaved(true);
+      } catch {
+        setSaved(false);
+        setNotice("本地保存失败，请检查启动窗口");
+        setTimeout(() => setNotice(""), 2800);
+      }
+    }, 650);
   };
 
   const updateEntry = (id: string, change: Partial<Entry>) => {
-    setEntries((current) => current.map((entry) => entry.id === id ? { ...entry, ...change } : entry));
-    markChanged();
+    const next = entries.map((entry) => entry.id === id ? { ...entry, ...change } : entry);
+    setEntries(next);
+    queueSave(next, dailySummary);
   };
 
   const filteredEntries = useMemo(() => entries.filter((entry) => {
@@ -125,24 +166,47 @@ export default function Home() {
       tags: ["未分类"],
       publish: false,
     };
-    setEntries((current) => [entry, ...current]);
+    const next = [entry, ...entries];
+    setEntries(next);
+    queueSave(next, dailySummary);
     setNewTitle("");
     setQuickAdd(false);
-    markChanged();
     setNotice("已添加一条记录");
     setTimeout(() => setNotice(""), 2200);
   };
 
-  const runPublish = () => {
-    if (publishStatus === "正在生成公开快照…") return;
-    setPublishStatus("正在生成公开快照…");
-    setTimeout(() => setPublishStatus("推送中…"), 900);
-    setTimeout(() => setPublishStatus("构建中…"), 1700);
-    setTimeout(() => {
-      setPublishStatus("已上线 · 刚刚");
-      setNotice("公开博客已更新");
-      setTimeout(() => setNotice(""), 2400);
-    }, 2800);
+  const runPublish = async () => {
+    if (publishStatus.includes("正在")) return;
+    if (serverMode !== "local") {
+      setNotice("发布只能从本地启动的工作台执行");
+      setTimeout(() => setNotice(""), 2800);
+      return;
+    }
+    try {
+      setPublishStatus("正在保存当前内容…");
+      const saveResponse = await fetch(`/api/days/${currentDate}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ summary: dailySummary, entries }),
+      });
+      if (!saveResponse.ok) throw new Error("当前内容保存失败");
+      setSaved(true);
+      setPublishStatus("正在生成 Markdown 并推送…");
+      const response = await fetch("/api/publish", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ date: currentDate }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "发布失败");
+      setPublishStatus(result.message || "已推送到 GitHub");
+      setNotice("已推送到 GitHub，博客正在构建");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "发布失败";
+      setPublishStatus(`发布失败：${message}`);
+      setNotice(message);
+    }
+    setTimeout(() => setNotice(""), 3200);
   };
 
   const navItems: { id: View; icon: string; label: string; meta?: string }[] = [
@@ -183,7 +247,7 @@ export default function Home() {
 
         <div className="sidebar-footer">
           <button><Mark>设</Mark><span>设置</span></button>
-          <div className="storage"><span><i />本地数据已连接</span><small>2.4 MB</small></div>
+          <div className="storage"><span><i className={serverMode === "local" ? "" : "offline"} />{serverMode === "local" ? "本地文件已连接" : serverMode === "connecting" ? "正在连接本地文件" : "本地服务未连接"}</span><small>{serverMode === "local" ? "JSON" : "--"}</small></div>
         </div>
       </aside>
 
@@ -195,7 +259,7 @@ export default function Home() {
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索记录、标签…" />
             <kbd>⌘ K</kbd>
           </label>
-          <div className="save-state"><i className={saved ? "" : "saving"} />{saved ? "已保存" : "保存中…"}</div>
+          <div className="save-state"><i className={saved ? "" : "saving"} />{serverMode === "offline" ? "未连接本地文件" : saved ? "已写入本地文件" : "保存中…"}</div>
           <button className="avatar" aria-label="个人设置">JX</button>
         </header>
 
@@ -215,7 +279,7 @@ export default function Home() {
 
               <div className="daily-intent">
                 <span>今日一句话</span>
-                <input defaultValue="把异步状态这件事真正讲明白。" onChange={markChanged} aria-label="今日一句话" />
+                <input value={dailySummary} onChange={(event) => { const next = event.target.value; setDailySummary(next); queueSave(entries, next); }} aria-label="今日一句话" />
               </div>
 
               <div className="entry-controls">
@@ -340,10 +404,10 @@ export default function Home() {
           <section className="blog-view">
             <div className="section-heading blog-heading">
               <div><span className="today-pill">发布前预览</span><h1>你的公开学习日志</h1><p>只有下方带“已选公开”的内容会进入公开快照。</p></div>
-              <div className="publish-actions"><span><i />{publishStatus}</span><button onClick={runPublish}>发布更新 <b>↗</b></button></div>
+              <div className="publish-actions"><span><i />{publishStatus}</span><button onClick={runPublish} disabled={serverMode !== "local"}>发布到 GitHub <b>↗</b></button><a href="https://jin-xi.github.io/" target="_blank" rel="noreferrer">查看博客</a></div>
             </div>
             <div className="preview-browser">
-              <div className="browser-bar"><i className="red" /><i className="yellow" /><i className="green" /><span>notes.jinxi.dev / days / 2026-09-27</span><button>↺</button></div>
+              <div className="browser-bar"><i className="red" /><i className="yellow" /><i className="green" /><span>jin-xi.github.io / 2026 / 09 / 27</span><button>↺</button></div>
               <div className="public-blog">
                 <header><button>拾光笔记</button><nav><span>时间线</span><span>专题</span><span>关于</span></nav><button className="theme-button">◐</button></header>
                 <article>
